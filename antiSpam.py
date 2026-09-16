@@ -10,6 +10,8 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
 from aiogram.filters import Command
 
+import ml_classifier
+
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -33,6 +35,14 @@ STATS_FILE = os.getenv("STATS_FILE", "stats.json")
 WHITELIST_FILE = os.getenv("WHITELIST_FILE", "whitelist.json")
 
 MAX_TEXT_LENGTH = int(os.getenv("MAX_TEXT_LENGTH", "500"))
+
+# Гибридная ML-классификация: пока модель не обучена или не уверена в ответе,
+# решение принимает Ollama (как раньше); каждое такое решение Ollama становится
+# новым обучающим примером, так что датасет растёт сам по себе.
+DATASET_FILE = os.getenv("DATASET_FILE", "dataset.jsonl")
+MODEL_FILE = os.getenv("MODEL_FILE", "model.joblib")
+MODEL_META_FILE = os.getenv("MODEL_META_FILE", "model_meta.json")
+ML_CONFIDENCE_THRESHOLD = float(os.getenv("ML_CONFIDENCE_THRESHOLD", "0.85"))
 
 # ================== IMPROVED PROMPT ==================
 
@@ -78,6 +88,7 @@ NOT_SALE — всё остальное
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 session: aiohttp.ClientSession | None = None
+ml = ml_classifier.MLClassifier(MODEL_FILE, MODEL_META_FILE)
 
 # ================== STORAGE ==================
 
@@ -109,9 +120,8 @@ async def update_stats(key: str):
     global stats_dirty
     async with stats_lock:
         today = get_today()
-        if today not in stats:
-            stats[today] = {"checked": 0, "allowed": 0, "deleted": 0}
-        stats[today][key] += 1
+        day = stats.setdefault(today, {"checked": 0, "allowed": 0, "deleted": 0, "ml_used": 0, "ollama_used": 0})
+        day[key] = day.get(key, 0) + 1
         stats_dirty = True
 
 async def stats_saver():
@@ -187,6 +197,45 @@ async def call_ollama(text: str) -> bool:
             print(f"❌ Ошибка Ollama: {e}")
             return True  # fail-safe: лучше оставить, чем удалить
 
+# ================== ГИБРИДНАЯ КЛАССИФИКАЦИЯ (ML + OLLAMA) ==================
+
+async def classify(text: str) -> tuple[bool, str]:
+    """Возвращает (is_sale, engine). engine — 'ml' или 'ollama'.
+
+    Пока ML-модель не обучена или не уверена в ответе, решение принимает Ollama —
+    как раньше. Каждое решение Ollama сохраняется как новый обучающий пример,
+    поэтому датасет пополняется сам по себе по мере работы бота.
+    """
+    if ml.is_ready:
+        label, confidence = await asyncio.to_thread(ml.predict, text)
+        if label is not None and confidence >= ML_CONFIDENCE_THRESHOLD:
+            return label == "SALE", "ml"
+
+    is_sale = await call_ollama(text)
+    return is_sale, "ollama"
+
+# ================== ЛОГ РЕШЕНИЙ (для /correct и /pending) ==================
+
+DECISION_LOG_MAX = 2000
+
+decision_counter = 0
+decision_log: "OrderedDict[int, dict]" = OrderedDict()
+
+def log_decision(text: str, label: str, engine: str, chat_id: int, message_id: int, user_id: int) -> int:
+    global decision_counter
+    decision_counter += 1
+    decision_log[decision_counter] = {
+        "text": text,
+        "label": label,
+        "source": engine,
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "user_id": user_id,
+    }
+    if len(decision_log) > DECISION_LOG_MAX:
+        decision_log.popitem(last=False)
+    return decision_counter
+
 ADMIN_CACHE_TTL = 300  # секунд
 
 admin_cache: dict[int, tuple[set[int], float]] = {}
@@ -237,15 +286,161 @@ async def show_stats(message: Message):
         return
 
     today = get_today()
-    today_stats = stats.get(today, {"checked": 0, "allowed": 0, "deleted": 0})
+    today_stats = stats.get(today, {"checked": 0, "allowed": 0, "deleted": 0, "ml_used": 0, "ollama_used": 0})
 
     text = f"""📊 Статистика за сегодня ({today}):
 
 Проверено сообщений: {today_stats['checked']}
 Оставлено (SALE): {today_stats['allowed']}
-Удалено (NOT_SALE): {today_stats['deleted']}"""
+Удалено (NOT_SALE): {today_stats['deleted']}
+
+Решений через ML: {today_stats.get('ml_used', 0)}
+Решений через Ollama: {today_stats.get('ollama_used', 0)}"""
 
     await message.reply(text)
+
+
+@dp.message(Command("mlstats"))
+async def show_ml_stats(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    n_examples = ml_classifier.count_dataset(DATASET_FILE)
+
+    if ml.is_ready:
+        meta = ml.meta
+        trained_at = meta.get("trained_at")
+        trained_at_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(trained_at)) if trained_at else "?"
+
+        text = f"""🧠 ML-модель: активна
+Обучена: {trained_at_str}
+Примеров при обучении: {meta.get('n_examples', '?')}
+Точность на отложенной выборке: {meta.get('accuracy', 0):.1%}
+Порог уверенности: {ML_CONFIDENCE_THRESHOLD:.0%}
+Примеров в датасете сейчас: {n_examples}
+
+Переобучить: /train"""
+    else:
+        text = f"""🧠 ML-модель: ещё не обучена (все решения принимает Ollama)
+Накоплено примеров в датасете: {n_examples}
+
+Обучить: /train"""
+
+    await message.reply(text)
+
+
+@dp.message(Command("train"))
+async def train_model_command(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    await message.reply("⏳ Обучение модели...")
+
+    try:
+        result = await asyncio.to_thread(ml_classifier.train, DATASET_FILE, MODEL_FILE, MODEL_META_FILE)
+    except ValueError as e:
+        await message.reply(f"⚠️ {e}")
+        return
+    except Exception as e:
+        await message.reply(f"❌ Ошибка обучения: {e}")
+        return
+
+    ml.reload()
+
+    await message.reply(
+        f"✅ Модель обучена и загружена\n"
+        f"Примеров: {result.n_examples} (train {result.n_train} / test {result.n_test})\n"
+        f"Точность на отложенной выборке: {result.accuracy:.1%}\n\n"
+        f"{result.report}"
+    )
+
+
+@dp.message(Command("pending"))
+async def show_pending(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    entries = [(rid, rec) for rid, rec in reversed(decision_log.items()) if rec["label"] == "NOT_SALE"][:10]
+
+    if not entries:
+        await message.reply("Нет недавних удалений в логе решений")
+        return
+
+    lines = ["🗑 Последние удаления (используйте /correct <id> sale, если это ошибка):"]
+    for rid, rec in entries:
+        snippet = rec["text"][:80].replace("\n", " ")
+        lines.append(f"#{rid} [{rec['source']}]: {snippet}")
+
+    await message.reply("\n".join(lines))
+
+
+@dp.message(Command("correct"))
+async def correct_decision(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    args = (message.text or "").split(maxsplit=2)[1:]
+
+    def parse_label(token: str) -> str | None:
+        token = token.lower()
+        if token in ("sale", "sell"):
+            return "SALE"
+        if token in ("spam", "not_sale"):
+            return "NOT_SALE"
+        return None
+
+    usage = (
+        "ℹ️ Использование:\n"
+        "• Ответом на сообщение: /correct sale|spam\n"
+        "• По ID из /pending: /correct <id> sale|spam"
+    )
+
+    if not args:
+        await message.reply(usage)
+        return
+
+    # Вариант 1: ответом на сообщение, которое ещё есть в чате
+    if message.reply_to_message and len(args) == 1:
+        label = parse_label(args[0])
+        if label is None:
+            await message.reply(usage)
+            return
+
+        target = message.reply_to_message
+        text = (target.text or target.caption or "").strip()
+        if not text:
+            await message.reply("⚠️ В этом сообщении нет текста")
+            return
+
+        ml_classifier.append_example(DATASET_FILE, text, label, "admin")
+
+        if label == "NOT_SALE":
+            try:
+                await target.delete()
+            except Exception as e:
+                print(f"❌ Не удалось удалить по /correct: {e}")
+
+        await message.reply(f"✅ Помечено как {label} и добавлено в датасет")
+        return
+
+    # Вариант 2: по ID из /pending (для уже удалённых сообщений)
+    if len(args) == 2 and args[0].isdigit():
+        decision_id = int(args[0])
+        label = parse_label(args[1])
+        record = decision_log.get(decision_id)
+
+        if record is None:
+            await message.reply("⚠️ Запись с таким ID не найдена (устарела или бот перезапускался)")
+            return
+        if label is None:
+            await message.reply(usage)
+            return
+
+        ml_classifier.append_example(DATASET_FILE, record["text"], label, "admin")
+        await message.reply(f"✅ Запись #{decision_id} переразмечена как {label} и добавлена в датасет")
+        return
+
+    await message.reply(usage)
 
 # ================== HANDLER ==================
 
@@ -273,13 +468,20 @@ async def handle_message(message: Message):
 
     await update_stats("checked")
 
-    is_sale = await call_ollama(text)
+    is_sale, engine = await classify(text)
+    label = "SALE" if is_sale else "NOT_SALE"
+    await update_stats("ml_used" if engine == "ml" else "ollama_used")
+
+    if engine == "ollama":
+        ml_classifier.append_example(DATASET_FILE, text, label, "ollama")
+
+    decision_id = log_decision(text, label, engine, message.chat.id, message.message_id, user_id)
 
     if is_sale:
-        print(f"✅ SALE → Оставляем | {text[:100]}...")
+        print(f"✅ SALE [{engine}] #{decision_id} → Оставляем | {text[:100]}...")
         await update_stats("allowed")
     else:
-        print(f"🗑 NOT_SALE → Удаляем | {text[:100]}...")
+        print(f"🗑 NOT_SALE [{engine}] #{decision_id} → Удаляем | {text[:100]}...")
         await update_stats("deleted")
         try:
             await message.delete()

@@ -5,6 +5,12 @@
 stats.json
 whitelist.json
 
+# ML: датасет содержит тексты сообщений пользователей — не должен попадать в репозиторий.
+# Модель и метаданные — это локальный обучаемый артефакт, тоже не коммитим.
+dataset.jsonl
+model.joblib
+model_meta.json
+
 # Python
 __pycache__/
 *.py[cod]
