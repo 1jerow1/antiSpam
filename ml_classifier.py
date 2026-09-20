@@ -4,11 +4,11 @@
 TF-IDF + логистическую регрессию и умеет отдавать модель для инференса.
 
 Формат строки датасета:
-    {"text": "...", "label": "SALE"|"NOT_SALE", "source": "admin"|"ollama"|"history", "ts": 1234567890.0}
+    {"text": "...", "label": "SALE"|"NOT_SALE", "source": "admin"|"claude"|"ollama"|"history", "ts": 1234567890.0}
 
 При обучении примеры дедуплицируются по нормализованному тексту. Если один и тот же
 текст встречается с разными метками, побеждает более надёжный источник:
-admin (подтверждено человеком) > ollama (решение модели в реальном времени) >
+admin (ваша правка) > claude (ручная проверка ассистентом) > ollama (решение LLM) >
 history (метка выведена из того, что сообщение уцелело в экспорте чата).
 """
 
@@ -32,13 +32,16 @@ from sklearn.pipeline import FeatureUnion, Pipeline
 # Меньшая выборка не позволяет честно оценить риск, поэтому порог удаления не выдаётся.
 MIN_SALE_EXAMPLES = 100
 MAX_FALSE_DELETION_RATE = 0.01
+# Оценка по кросс-валидации оптимистична: в датасете много близких копий и «лёгких» объявлений.
+# Поэтому удалять начинаем не ниже этого порога, даже если калибровка разрешает меньше.
+MIN_DELETE_THRESHOLD = 0.9
 
 
 def normalize_text(text: str) -> str:
     return " ".join(text.lower().split())
 
 
-_SOURCE_PRIORITY = {"admin": 2, "ollama": 1}
+_SOURCE_PRIORITY = {"admin": 3, "claude": 2, "ollama": 1}
 
 
 def _priority(record: dict) -> int:
@@ -187,7 +190,7 @@ def calibrate_delete_threshold(texts, labels, make_pipeline, min_sale: int, max_
     is_sale = y == "SALE"
     allowed = int(max_false_rate * n_sale)
     sale_p = np.sort(p_not[is_sale])[::-1]
-    threshold = max(float(np.nextafter(sale_p[allowed], 1.0)), 0.5)
+    threshold = max(float(np.nextafter(sale_p[allowed], 1.0)), MIN_DELETE_THRESHOLD)
     deleted = p_not >= threshold
 
     return {
