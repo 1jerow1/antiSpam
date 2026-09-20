@@ -8,8 +8,13 @@ whitelist.json
 # ML: датасет содержит тексты сообщений пользователей — не должен попадать в репозиторий.
 # Модель и метаданные — это локальный обучаемый артефакт, тоже не коммитим.
 dataset.jsonl
+*.bak
 model.joblib
 model_meta.json
+
+# Экспорт истории чата из Telegram Desktop (личные данные, для import_history.py)
+result.json
+ChatExport_*/
 
 # Python
 __pycache__/

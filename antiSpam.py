@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import os
 import time
@@ -31,18 +32,34 @@ if not ADMIN_ID:
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3:8b")
 
-STATS_FILE = os.getenv("STATS_FILE", "stats.json")
-WHITELIST_FILE = os.getenv("WHITELIST_FILE", "whitelist.json")
+# Каталог для всех файлов состояния. На Railway файловая система стирается при каждом
+# деплое, поэтому к сервису подключают том — он монтируется в RAILWAY_VOLUME_MOUNT_PATH.
+DATA_DIR = os.getenv("DATA_DIR") or os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or "."
+
+def data_path(env_name: str, default_name: str) -> str:
+    return os.getenv(env_name) or os.path.join(DATA_DIR, default_name)
+
+STATS_FILE = data_path("STATS_FILE", "stats.json")
+WHITELIST_FILE = data_path("WHITELIST_FILE", "whitelist.json")
 
 MAX_TEXT_LENGTH = int(os.getenv("MAX_TEXT_LENGTH", "500"))
 
 # Гибридная ML-классификация: пока модель не обучена или не уверена в ответе,
 # решение принимает Ollama (как раньше); каждое такое решение Ollama становится
 # новым обучающим примером, так что датасет растёт сам по себе.
-DATASET_FILE = os.getenv("DATASET_FILE", "dataset.jsonl")
-MODEL_FILE = os.getenv("MODEL_FILE", "model.joblib")
-MODEL_META_FILE = os.getenv("MODEL_META_FILE", "model_meta.json")
+DATASET_FILE = data_path("DATASET_FILE", "dataset.jsonl")
+MODEL_FILE = data_path("MODEL_FILE", "model.joblib")
+MODEL_META_FILE = data_path("MODEL_META_FILE", "model_meta.json")
 ML_CONFIDENCE_THRESHOLD = float(os.getenv("ML_CONFIDENCE_THRESHOLD", "0.85"))
+
+# USE_OLLAMA=false — чистый ML без Ollama (например, на Railway). Бот удаляет сообщение
+# только если модель уверена, что это не объявление о продаже (порог подбирается при
+# обучении, см. ml_classifier.calibrate_delete_threshold); всё сомнительное остаётся.
+USE_OLLAMA = os.getenv("USE_OLLAMA", "true").strip().lower() in ("1", "true", "yes")
+ML_DELETE_THRESHOLD = float(os.environ["ML_DELETE_THRESHOLD"]) if os.getenv("ML_DELETE_THRESHOLD") else None
+ML_MIN_SALE_EXAMPLES = int(os.getenv("ML_MIN_SALE_EXAMPLES", str(ml_classifier.MIN_SALE_EXAMPLES)))
+
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 
 # ================== IMPROVED PROMPT ==================
 
@@ -89,6 +106,17 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 session: aiohttp.ClientSession | None = None
 ml = ml_classifier.MLClassifier(MODEL_FILE, MODEL_META_FILE)
+
+# Тексты, по которым в датасете уже есть надёжная метка: повторы спама не дописываем,
+# иначе файл растёт на каждое повторное сообщение, а новой информации в нём нет.
+dataset_seen = ml_classifier.known_texts(DATASET_FILE, trusted_only=True)
+
+def add_example(text: str, label: str, source: str) -> None:
+    key = ml_classifier.normalize_text(text)
+    if source == "ollama" and key in dataset_seen:
+        return
+    ml_classifier.append_example(DATASET_FILE, text, label, source)
+    dataset_seen.add(key)
 
 # ================== STORAGE ==================
 
@@ -199,17 +227,48 @@ async def call_ollama(text: str) -> bool:
 
 # ================== ГИБРИДНАЯ КЛАССИФИКАЦИЯ (ML + OLLAMA) ==================
 
+def effective_delete_threshold() -> float | None:
+    return ML_DELETE_THRESHOLD if ML_DELETE_THRESHOLD is not None else ml.delete_threshold
+
+def mode_summary() -> str:
+    if USE_OLLAMA:
+        threshold = effective_delete_threshold()
+        deletes = f"ML удаляет при P(NOT_SALE) ≥ {threshold:.2f}" if threshold is not None and ml.is_ready else "ML не удаляет"
+        return f"гибрид: {deletes}, оставляет при уверенности ≥ {ML_CONFIDENCE_THRESHOLD:.0%}, остальное — Ollama"
+    if not ml.is_ready:
+        return "только ML — модель не обучена, сообщения НЕ удаляются"
+    threshold = effective_delete_threshold()
+    if threshold is None:
+        return "только ML — модель не прошла калибровку, сообщения НЕ удаляются"
+    return f"только ML: удаление при P(NOT_SALE) ≥ {threshold:.2f}, всё сомнительное остаётся"
+
+def format_calibration(meta: dict) -> str:
+    if meta.get("delete_threshold") is None:
+        return f"Калибровка не пройдена: {meta.get('note') or 'нет данных'}"
+    return (
+        f"Порог удаления: P(NOT_SALE) ≥ {meta['delete_threshold']:.2f}\n"
+        f"Кросс-валидация: ложно удалено объявлений {meta.get('false_deletions', 0)} из {meta.get('n_sale', '?')}, "
+        f"спама распознано {meta.get('delete_recall', 0):.0%}"
+    )
+
 async def classify(text: str) -> tuple[bool, str]:
     """Возвращает (is_sale, engine). engine — 'ml' или 'ollama'.
 
-    Пока ML-модель не обучена или не уверена в ответе, решение принимает Ollama —
-    как раньше. Каждое решение Ollama сохраняется как новый обучающий пример,
-    поэтому датасет пополняется сам по себе по мере работы бота.
+    ML удаляет только при P(NOT_SALE) выше откалиброванного порога (см. ml_classifier.calibrate_delete_threshold).
+
+    USE_OLLAMA=false: всё остальное остаётся.
+    Гибрид: ML оставляет сообщение, если уверен в SALE (≥ ML_CONFIDENCE_THRESHOLD); в остальных случаях
+    решает Ollama, а её ответ сохраняется как новый обучающий пример — датасет пополняется сам.
     """
-    if ml.is_ready:
-        label, confidence = await asyncio.to_thread(ml.predict, text)
-        if label is not None and confidence >= ML_CONFIDENCE_THRESHOLD:
-            return label == "SALE", "ml"
+    p_not_sale = await asyncio.to_thread(ml.p_not_sale, text) if ml.is_ready else None
+    threshold = effective_delete_threshold()
+
+    if p_not_sale is not None and threshold is not None and p_not_sale >= threshold:
+        return False, "ml"
+    if not USE_OLLAMA:
+        return True, "ml"
+    if p_not_sale is not None and 1 - p_not_sale >= ML_CONFIDENCE_THRESHOLD:
+        return True, "ml"
 
     is_sale = await call_ollama(text)
     return is_sale, "ollama"
@@ -313,15 +372,17 @@ async def show_ml_stats(message: Message):
         trained_at_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(trained_at)) if trained_at else "?"
 
         text = f"""🧠 ML-модель: активна
+Режим: {mode_summary()}
 Обучена: {trained_at_str}
-Примеров при обучении: {meta.get('n_examples', '?')}
+Примеров при обучении: {meta.get('n_examples', '?')} (SALE: {meta.get('n_sale', '?')})
 Точность на отложенной выборке: {meta.get('accuracy', 0):.1%}
-Порог уверенности: {ML_CONFIDENCE_THRESHOLD:.0%}
+{format_calibration(meta)}
 Примеров в датасете сейчас: {n_examples}
 
 Переобучить: /train"""
     else:
-        text = f"""🧠 ML-модель: ещё не обучена (все решения принимает Ollama)
+        text = f"""🧠 ML-модель: ещё не обучена
+Режим: {mode_summary()}
 Накоплено примеров в датасете: {n_examples}
 
 Обучить: /train"""
@@ -337,7 +398,9 @@ async def train_model_command(message: Message):
     await message.reply("⏳ Обучение модели...")
 
     try:
-        result = await asyncio.to_thread(ml_classifier.train, DATASET_FILE, MODEL_FILE, MODEL_META_FILE)
+        result = await asyncio.to_thread(
+            ml_classifier.train, DATASET_FILE, MODEL_FILE, MODEL_META_FILE, ML_MIN_SALE_EXAMPLES
+        )
     except ValueError as e:
         await message.reply(f"⚠️ {e}")
         return
@@ -349,8 +412,10 @@ async def train_model_command(message: Message):
 
     await message.reply(
         f"✅ Модель обучена и загружена\n"
-        f"Примеров: {result.n_examples} (train {result.n_train} / test {result.n_test})\n"
-        f"Точность на отложенной выборке: {result.accuracy:.1%}\n\n"
+        f"Режим: {mode_summary()}\n"
+        f"Примеров: {result.n_examples} (SALE: {result.n_sale}; train {result.n_train} / test {result.n_test})\n"
+        f"Точность на отложенной выборке: {result.accuracy:.1%}\n"
+        f"{format_calibration(ml.meta)}\n\n"
         f"{result.report}"
     )
 
@@ -412,7 +477,7 @@ async def correct_decision(message: Message):
             await message.reply("⚠️ В этом сообщении нет текста")
             return
 
-        ml_classifier.append_example(DATASET_FILE, text, label, "admin")
+        add_example(text, label, "admin")
 
         if label == "NOT_SALE":
             try:
@@ -436,11 +501,33 @@ async def correct_decision(message: Message):
             await message.reply(usage)
             return
 
-        ml_classifier.append_example(DATASET_FILE, record["text"], label, "admin")
+        add_example(record["text"], label, "admin")
         await message.reply(f"✅ Запись #{decision_id} переразмечена как {label} и добавлена в датасет")
         return
 
     await message.reply(usage)
+
+
+@dp.message(F.document, F.chat.type == "private", F.from_user.id == ADMIN_ID)
+async def receive_dataset(message: Message):
+    doc = message.document
+    if doc.file_size and doc.file_size > MAX_UPLOAD_BYTES:
+        await message.reply("⚠️ Файл слишком большой (максимум 10 МБ)")
+        return
+
+    buffer = io.BytesIO()
+    await bot.download(doc, destination=buffer)
+    raw = buffer.getvalue().decode("utf-8-sig", errors="replace")
+
+    added, duplicates, invalid = ml_classifier.merge_records(DATASET_FILE, raw)
+    dataset_seen.clear()
+    dataset_seen.update(ml_classifier.known_texts(DATASET_FILE, trusted_only=True))
+
+    await message.reply(
+        f"✅ Датасет пополнен: +{added}, уже было {duplicates}, некорректных строк {invalid}\n"
+        f"Всего примеров: {ml_classifier.count_dataset(DATASET_FILE)}\n\n"
+        f"Дальше: /train"
+    )
 
 # ================== HANDLER ==================
 
@@ -473,7 +560,7 @@ async def handle_message(message: Message):
     await update_stats("ml_used" if engine == "ml" else "ollama_used")
 
     if engine == "ollama":
-        ml_classifier.append_example(DATASET_FILE, text, label, "ollama")
+        add_example(text, label, "ollama")
 
     decision_id = log_decision(text, label, engine, message.chat.id, message.message_id, user_id)
 
@@ -496,6 +583,8 @@ async def main():
 
     asyncio.create_task(stats_saver())
 
+    print(f"📁 Каталог данных: {os.path.abspath(DATA_DIR)}")
+    print(f"🔀 Режим: {mode_summary()}")
     print("🚀 Бот запущен...")
 
     try:
