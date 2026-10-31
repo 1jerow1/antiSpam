@@ -8,8 +8,8 @@ from collections import OrderedDict
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message
-from aiogram.filters import Command
+from aiogram.types import ChatMemberUpdated, Message, User
+from aiogram.filters import JOIN_TRANSITION, ChatMemberUpdatedFilter, Command
 
 import ml_classifier
 
@@ -60,6 +60,18 @@ ML_DELETE_THRESHOLD = float(os.environ["ML_DELETE_THRESHOLD"]) if os.getenv("ML_
 ML_MIN_SALE_EXAMPLES = int(os.getenv("ML_MIN_SALE_EXAMPLES", str(ml_classifier.MIN_SALE_EXAMPLES)))
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+
+# BLOCK_BOTS=true — банить ботов, которых добавил в чат не администратор, и удалять
+# сообщения ботов, не являющихся админами чата. Боты из whitelist пропускаются.
+BLOCK_BOTS = os.getenv("BLOCK_BOTS", "true").strip().lower() in ("1", "true", "yes")
+
+# Служебные «боты» Telegram: от их имени приходят сообщения анонимных админов,
+# каналов и автопересылки из канала. Банить их нельзя.
+SERVICE_BOT_IDS = {
+    777000,      # Telegram (автопересылка из привязанного канала)
+    1087968824,  # GroupAnonymousBot (анонимный админ)
+    136817688,   # Channel_Bot (сообщение от имени канала)
+}
 
 # ================== IMPROVED PROMPT ==================
 
@@ -299,8 +311,7 @@ ADMIN_CACHE_TTL = 300  # секунд
 
 admin_cache: dict[int, tuple[set[int], float]] = {}
 
-async def is_admin(message: Message) -> bool:
-    chat_id = message.chat.id
+async def chat_admin_ids(chat_id: int) -> set[int]:
     now = time.monotonic()
 
     cached = admin_cache.get(chat_id)
@@ -313,10 +324,43 @@ async def is_admin(message: Message) -> bool:
         except Exception as e:
             print(f"❌ Ошибка получения списка админов: {e}")
             if cached is None:
-                return False
+                return set()
             # используем протухший кеш, лучше так, чем дёргать API на каждое сообщение
 
-    return message.from_user.id in cached[0]
+    return cached[0]
+
+async def is_admin(message: Message) -> bool:
+    return message.from_user.id in await chat_admin_ids(message.chat.id)
+
+# ================== БЛОКИРОВКА БОТОВ ==================
+
+def is_blockable_bot(user: User | None) -> bool:
+    return (
+        BLOCK_BOTS
+        and user is not None
+        and user.is_bot
+        and user.id != bot.id
+        and user.id not in SERVICE_BOT_IDS
+        and user.id not in whitelist
+    )
+
+async def ban_bot(chat_id: int, user: User, reason: str) -> None:
+    try:
+        await bot.ban_chat_member(chat_id, user.id)
+        print(f"🚫 Бот забанен ({reason}): @{user.username} id={user.id}")
+    except Exception as e:
+        print(f"❌ Не удалось забанить бота @{user.username} id={user.id}: {e}")
+
+async def handle_bot_join(chat_id: int, new_user: User, inviter: User | None) -> bool:
+    """Банит вошедшего бота, если его добавил не администратор. Возвращает True, если забанен."""
+    if not is_blockable_bot(new_user):
+        return False
+    admins = await chat_admin_ids(chat_id)
+    if inviter is not None and inviter.id in admins | {ADMIN_ID}:
+        print(f"ℹ️ Бота @{new_user.username} добавил администратор — оставляем")
+        return False
+    await ban_bot(chat_id, new_user, f"добавил {inviter.id if inviter else '?'}")
+    return True
 
 # ================== ADMIN COMMANDS ==================
 # Регистрируются раньше handle_message, иначе он перехватит команды
@@ -531,6 +575,38 @@ async def receive_dataset(message: Message):
 
 # ================== HANDLER ==================
 
+@dp.chat_member(ChatMemberUpdatedFilter(member_status_changed=JOIN_TRANSITION))
+async def on_member_join(event: ChatMemberUpdated):
+    # Приходит, только если бот — админ чата и chat_member есть в allowed_updates (см. main).
+    await handle_bot_join(event.chat.id, event.new_chat_member.user, event.from_user)
+
+
+@dp.message(F.new_chat_members)
+async def on_new_chat_members(message: Message):
+    # Запасной путь через служебное сообщение «X добавил Y»: работает и без chat_member-апдейтов.
+    banned = False
+    for user in message.new_chat_members:
+        banned |= await handle_bot_join(message.chat.id, user, message.from_user)
+    if banned:
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+
+@dp.message(F.from_user.is_bot)
+async def on_bot_message(message: Message):
+    # Бот, который уже оказался в чате (например, вошёл до включения блокировки).
+    user = message.from_user
+    if not is_blockable_bot(user) or user.id in await chat_admin_ids(message.chat.id):
+        return
+    try:
+        await message.delete()
+    except Exception as e:
+        print(f"❌ Не удалось удалить сообщение бота: {e}")
+    await ban_bot(message.chat.id, user, "написал в чат")
+
+
 @dp.message(
     ~F.from_user.is_bot,
     F.text | F.caption
@@ -585,10 +661,12 @@ async def main():
 
     print(f"📁 Каталог данных: {os.path.abspath(DATA_DIR)}")
     print(f"🔀 Режим: {mode_summary()}")
+    print(f"🤖 Блокировка ботов: {'включена' if BLOCK_BOTS else 'выключена'}")
     print("🚀 Бот запущен...")
 
     try:
-        await dp.start_polling(bot)
+        # chat_member по умолчанию не присылается — его нужно запросить явно.
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         if session and not session.closed:
             await session.close()
